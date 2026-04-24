@@ -34,7 +34,7 @@ def initialize_system():
 
         if not os.path.exists("movies_data.json"):
             print("  Fetching initial movie data from TMDB...")
-            data_fetcher.fetch_movies(pages=5)
+            data_fetcher.fetch_diversified_content()
 
         vector_engine.setup_vector_db()
         print("  Setup complete!")

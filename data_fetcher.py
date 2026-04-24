@@ -202,5 +202,41 @@ def search_movies(query):
     print(f"Found {len(new_movies)} total movies via TMDB search.")
     return new_movies
 
+def fetch_diversified_content():
+    """Fetches a mix of popular, Tamil, Drama, and Comedy movies to build a strong local base."""
+    print("Building a diversified local dataset...")
+    all_movies = []
+    
+    # 1. Popular movies (2 pages)
+    print("Fetching Popular movies...")
+    all_movies.extend(discover_movies(sort_by="popularity.desc", pages=2))
+    
+    # 2. Tamil movies (2 pages)
+    print("Fetching Tamil movies...")
+    all_movies.extend(discover_movies(language_code="ta", sort_by="popularity.desc", pages=2))
+    
+    # 3. Drama movies (1 page)
+    print("Fetching Drama movies...")
+    all_movies.extend(discover_movies(genre_id=18, pages=1))
+    
+    # 4. Comedy movies (1 page)
+    print("Fetching Comedy movies...")
+    all_movies.extend(discover_movies(genre_id=35, pages=1))
+    
+    # Remove duplicates
+    seen_ids = set()
+    unique_movies = []
+    for m in all_movies:
+        if m['id'] not in seen_ids:
+            unique_movies.append(m)
+            seen_ids.add(m['id'])
+            
+    # Save to JSON
+    with open("movies_data.json", "w", encoding="utf-8") as f:
+        json.dump(unique_movies, f, indent=4, ensure_ascii=False)
+        
+    print(f"Successfully built a diversified dataset with {len(unique_movies)} movies.")
+    return unique_movies
+
 if __name__ == "__main__":
-    fetch_movies(pages=5) # 5 pages = ~100 movies
+    fetch_diversified_content()

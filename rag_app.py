@@ -20,10 +20,17 @@ MOOD_MAP = {
     "inspire": "drama",
     "inspiration": "drama",
     "inspirational": "drama",
+    "stress": "comedy",
+    "stressed": "comedy",
+    "tired": "comedy",
+    "relax": "comedy",
+    "light": "comedy",
+    "lite": "comedy",
+    "fun": "comedy",
+    "funny": "comedy",
+    "happy": "comedy",
     "feel good": "comedy",
     "sad": "drama",
-    "happy": "comedy",
-    "better": "comedy",
     "excited": "action",
     "scared": "horror",
     "romantic": "romance"
@@ -51,8 +58,10 @@ else:
     INTENT_MODEL = "phi3:mini"
     CHAT_MODEL = "gemma2:2b"
 
-# ── Conversation memory (persists for the whole session) ───────────────────
+# ── Caches and Session Data ────────────────────────────────────────────────
 chat_history = []   # List of {"role": "user"/"assistant", "content": "..."}
+results_cache = {}  # Cache query -> processed results
+last_movie_title = None # Tracks the most recently discussed movie title
 
 def _llm(messages, model=CHAT_MODEL):
     """Call the configured LLM provider (Ollama or Groq)."""
@@ -94,13 +103,17 @@ def get_recommendations(query, language_code=None, n_results=15):  # fetch more 
         return None
     return results
 
-def filter_results(results, min_year=None, min_rating=None, max_results=10):
-    """Post-filter ChromaDB results by year and rating."""
+def filter_results(results, query="", min_year=None, min_rating=None, max_results=10):
+    """Post-filter and RANK results using a weighted score + keyword boost."""
     if results is None:
         return None
-    filtered = {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
+        
+    query_words = set(re.findall(r'\w+', query.lower()))
+    scored_items = []
     for i, meta in enumerate(results['metadatas'][0]):
         rating = meta.get('vote_average', 0.0)
+        distance = results['distances'][0][i]
+        title = meta['title'].lower()
         release = meta.get('release_date', '') or ''
         year = int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else 0
 
@@ -109,17 +122,112 @@ def filter_results(results, min_year=None, min_rating=None, max_results=10):
         if min_year and year < min_year:
             continue
 
-        filtered['documents'][0].append(results['documents'][0][i])
-        filtered['metadatas'][0].append(meta)
-        filtered['distances'][0].append(results['distances'][0][i])
+        # 1. Base Score: 50% Similarity (1-dist), 30% Rating
+        similarity = max(0, 1 - distance)
+        score = (similarity * 0.5) + ((rating / 10.0) * 0.3)
+        
+        # 2. Mood Boost: If "comedy" is in genres, give it a 20% boost
+        if "comedy" in meta['genres'].lower():
+            score += 0.2
+            
+        # 3. Hybrid Keyword Boost: If query word is in the title, boost score significantly
+        title_words = set(re.findall(r'\w+', title))
+        if query_words.intersection(title_words):
+            score += 0.3 # Large boost for exact keyword matches
+        
+        scored_items.append({
+            'doc': results['documents'][0][i],
+            'meta': meta,
+            'dist': distance,
+            'score': score
+        })
 
-        if len(filtered['documents'][0]) >= max_results:
-            break
+    # Sort by the final boosted score
+    scored_items.sort(key=lambda x: x['score'], reverse=True)
+    top_items = scored_items[:max_results]
 
-    return filtered if filtered['documents'][0] else None
+    if not top_items:
+        return None
+
+    return {
+        'documents': [[x['doc'] for x in top_items]],
+        'metadatas': [[x['meta'] for x in top_items]],
+        'distances': [[x['dist'] for x in top_items]]
+    }
+
+def filter_by_mood(results, query):
+    """If user wants 'lite' mood, strictly filter for Comedy, Family, or Romance."""
+    if not results or not results['metadatas'][0]:
+        return results
+        
+    lite_keywords = ["lite", "light", "stress", "tired", "relax", "fun", "happy"]
+    if not any(k in query.lower() for k in lite_keywords):
+        return results # Not a lite mood request
+        
+    print("  [System] Strict Mood Filtering: Keeping only light-hearted genres...")
+    filtered = {'documents':[[]], 'metadatas':[[]], 'distances':[[]]}
+    for i, meta in enumerate(results['metadatas'][0]):
+        genres = meta.get("genres", "").lower()
+        if any(g in genres for g in ["comedy", "family", "romance"]):
+            filtered['documents'][0].append(results['documents'][0][i])
+            filtered['metadatas'][0].append(meta)
+            filtered['distances'][0].append(results['distances'][0][i])
+            
+    return filtered if filtered['documents'][0] else results
+
+def rerank_results(query, results):
+    """Use the LLM to rerank the top results based on true semantic meaning."""
+    if not results or not results['metadatas'][0]:
+        return results
+        
+    titles = [m['title'] for m in results['metadatas'][0]]
+    prompt = (
+        f"User query: \"{query}\"\n"
+        f"List of movies: {', '.join(titles)}\n\n"
+        f"Re-order these movies from most relevant to least relevant for the query.\n"
+        f"Return ONLY the titles as a comma-separated list. Do not explain anything."
+    )
+    
+    reranked_text = _llm([{"role": "user", "content": prompt}], model=INTENT_MODEL)
+    if not reranked_text:
+        return results
+        
+    # Re-order the results dictionary based on the LLM's preferred order
+    order = [t.strip().lower() for t in reranked_text.split(',')]
+    
+    new_docs, new_metas, new_dists = [], [], []
+    for title_name in order:
+        for i, m in enumerate(results['metadatas'][0]):
+            if m['title'].lower() == title_name:
+                new_docs.append(results['documents'][0][i])
+                new_metas.append(m)
+                new_dists.append(results['distances'][0][i])
+                break
+                
+    # Add any missing ones at the end
+    for i, m in enumerate(results['metadatas'][0]):
+        if m['title'] not in [x['title'] for x in new_metas]:
+            new_docs.append(results['documents'][0][i])
+            new_metas.append(m)
+            new_dists.append(results['distances'][0][i])
+
+    return {
+        'documents': [new_docs],
+        'metadatas': [new_metas],
+        'distances': [new_dists]
+    }
 
 def check_relevance(query, search_results):
-    """Ask the LLM — using conversation history — if results match the query."""
+    """Hybrid Relevance: Combined distance threshold and LLM check."""
+    if not search_results or not search_results['metadatas'][0]:
+        return False
+        
+    # 1. Distance Threshold Check (Tightened)
+    avg_dist = sum(search_results['distances'][0][:3]) / 3 if len(search_results['distances'][0]) >= 3 else 2.0
+    if avg_dist > 0.7: # High threshold for better precision
+        return False
+
+    # 2. LLM Reasoning Check
     context = "\n".join(
         search_results['metadatas'][0][i]['title']
         for i in range(min(5, len(search_results['metadatas'][0])))
@@ -141,11 +249,12 @@ def check_relevance(query, search_results):
 def extract_query_intent(query):
     """Detect if user wants discover (language/genre) or title search, and if 'latest'."""
     LATEST_WORDS = ["latest", "new", "recent", "newest", "2024", "2025", "2023", "2022"]
-    DISCOVER_KEYWORDS = ["suggest", "recommend", "movies", "feel", "sad", "happy", "motivation", "motivational", "inspire", "inspiration", "best", "top", "good"]
+    DISCOVER_KEYWORDS = ["suggest", "recommend", "show", "get", "find", "movies", "film", "recommendation", "best", "top", "good", "latest", "new"]
     
     query_lower = query.lower()
     is_latest = any(w in query_lower for w in LATEST_WORDS)
-    is_recommendation = any(k in query_lower for k in DISCOVER_KEYWORDS) or len(query.split()) > 4
+    # Only treat as recommendation if it contains a keyword AND is long enough, or starts with a verb
+    is_recommendation = any(k in query_lower for k in DISCOVER_KEYWORDS) and len(query.split()) > 2
 
     lang_list  = ", ".join(LANGUAGE_MAP.keys())
     genre_list = ", ".join(GENRE_MAP.keys())
@@ -177,8 +286,9 @@ JSON:"""
         'genre_id': None, 'person': None, 'keywords': None, 'is_latest': is_latest
     }
 
-    # Manual Greeting check
-    if query_lower in ["hi", "hello", "hey", "hola", "namaste"]:
+    # Manual Greeting and Emotional check
+    CHAT_KEYWORDS = ["hi", "hello", "hey", "hola", "namaste", "how are you", "what's up", "good morning", "good evening", "mood", "feeling", "was in", "i am", "i'm"]
+    if any(k in query_lower for k in CHAT_KEYWORDS) and not any(k in query_lower for k in ["movie", "show", "suggest"]):
         intent['type'] = 'chat'
         return intent
 
@@ -253,21 +363,36 @@ def build_movies_text(search_results):
 def generate_response(query, search_results):
     movies_text, context_summary = build_movies_text(search_results)
 
-    # Add conversation history + current context to get a relevant intro
+    # Advanced Generation: Reasoning over the context
     summary_prompt = (
-        f"You are a friendly movie recommendation assistant.\n"
-        f"The user asked: \"{query}\"\n"
-        f"You found these movies:\n{context_summary}\n\n"
-        f"Write a SHORT 2-3 sentence friendly intro. Do NOT list the movies again."
+        f"You are a movie expert who understands user moods and preferences.\n"
+        f"The user said: \"{query}\"\n"
+        f"You chose these movies based on their similarity, rating, and relevance:\n{context_summary}\n\n"
+        f"Explain in 3 sentences WHY these specific movies were selected for their request.\n"
+        f"Mention specific themes from the movies that match the user's mood."
     )
     messages  = chat_history + [{"role": "user", "content": summary_prompt}]
-    commentary = _llm(messages, model=CHAT_MODEL) or "Here are the movies I found for you:"
+    commentary = _llm(messages, model=CHAT_MODEL) or "Based on your interest, I've selected these highly-rated matches:"
 
     return f"{commentary}\n\n{movies_text}"
 
+def is_short_query(query):
+    return len(query.split()) <= 6
+
 def handle_followup(query):
-    """Handle follow-up questions using only the conversation history (no DB search needed)."""
-    messages = chat_history + [{"role": "user", "content": query}]
+    """Handle follow-up questions with conditional verbosity."""
+    if is_short_query(query):
+        prompt = f"""User question: "{query}"
+Give a SHORT answer (2–4 lines).
+- Be simple and conversational
+- Give opinion (good / average / worth watching)
+- NO awards, NO trivia, NO long explanation
+- Do NOT invent facts
+Answer:"""
+    else:
+        prompt = query
+
+    messages = chat_history + [{"role": "user", "content": prompt}]
     return _llm(messages, model=CHAT_MODEL) or "I'm not sure — could you rephrase your question?"
 
 def is_followup(query):
@@ -322,19 +447,38 @@ def main():
             print("Goodbye! 🎬")
             break
 
+        # -- Context Tracking & Resolution --
+        global last_movie_title
+        q_lower = query.lower()
+        if any(h in q_lower for h in ["how is it", "this movie", "see this", "about it"]):
+            if last_movie_title:
+                query = f"Give short opinion about {last_movie_title}"
+                print(f"  [Context] Resolved 'it' to: {last_movie_title}")
+
         # -- Add user message to history --
         chat_history.append({"role": "user", "content": query})
 
         # -- Check if it's a follow-up question --
         if is_followup(query) and len(chat_history) > 2:
             print("[Chatbot] Answering follow-up from conversation memory...")
+            
+            # If the user typed just a movie name, update last_movie_title
+            if len(query.split()) < 4:
+                last_movie_title = query
+
             response = handle_followup(query)
             print(f"\nChatbot: {response}\n")
             chat_history.append({"role": "assistant", "content": response})
             continue
 
-        # -- Extract Intent FIRST so we know the language --
+        # -- Extract Intent FIRST --
         intent = extract_query_intent(query)
+        
+        # Force genre if discover intent detected but no genre identified
+        if intent['type'] == 'discover' and not intent['genre_id']:
+            if any(k in query.lower() for k in ["lite", "light", "stress", "tired", "relax", "fun", "happy"]):
+                intent['genre_id'] = GENRE_MAP.get("comedy")
+                
         print(f"  Intent: type={intent['type']}, lang={intent['language_code']}, genre={intent['genre_id']}, latest={intent['is_latest']}")
 
         # -- Handle simple chat/greetings --
@@ -344,39 +488,48 @@ def main():
             chat_history.append({"role": "assistant", "content": response})
             continue
 
-        # -- Vector DB search with language filter --
-        results = get_recommendations(query, language_code=intent['language_code'])
-        results = filter_results(results, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
+        # -- Check Cache First --
+        if query in results_cache:
+            results = results_cache[query]
+        else:
+            # -- Vector DB search --
+            results = get_recommendations(query, language_code=intent['language_code'])
+            results = filter_results(results, query=query, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
+            results = filter_by_mood(results, query) # Apply strict mood filtering
 
-        # -- Fallback to TMDB if DB results are not relevant, or if a specific person was requested --
-        if not results or intent.get('person') or not check_relevance(query, results):
-            print("[Chatbot] Fetching more movies from TMDB...")
+            # -- Fallback to TMDB --
+            if not results or intent.get('person') or not check_relevance(query, results):
+                print("[Chatbot] Fetching more movies from TMDB...")
+                if intent['type'] == 'discover':
+                    sort_by  = "release_date.desc" if intent['is_latest'] else "popularity.desc"
+                    year_gte = 2022 if intent['is_latest'] else None
+                    person_id = get_person_id(intent['person']) if intent.get('person') else None
+                    
+                    # Ensure genre_id is passed
+                    new_movies = discover_movies(
+                        language_code=intent['language_code'], 
+                        genre_id=intent['genre_id'], 
+                        sort_by=sort_by, 
+                        year_gte=year_gte, 
+                        person_id=person_id, 
+                        pages=3
+                    )
+                else:
+                    keywords   = intent['keywords'] or query
+                    new_movies = search_movies(keywords)
+
+                if new_movies:
+                    add_movies_to_db(new_movies)
+                    results = get_recommendations(query, language_code=intent['language_code'])
+                    results = filter_results(results, query=query, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
+                    results = filter_by_mood(results, query) # Re-apply mood filtering after TMDB fetch
             
-            if intent['type'] == 'discover':
-                sort_by  = "release_date.desc" if intent['is_latest'] else "popularity.desc"
-                year_gte = 2022 if intent['is_latest'] else None
-                person_id = None
-                if intent.get('person'):
-                    person_id = get_person_id(intent['person'])
-                    print(f"  Resolved person '{intent['person']}' to ID: {person_id}")
-
-                new_movies = discover_movies(
-                    language_code=intent['language_code'],
-                    genre_id=intent['genre_id'],
-                    sort_by=sort_by,
-                    year_gte=year_gte,
-                    person_id=person_id,
-                    pages=3
-                )
-            else:
-                keywords   = intent['keywords'] or query
-                print(f"  Searching TMDB by title: '{keywords}'")
-                new_movies = search_movies(keywords)
-
-            if new_movies:
-                add_movies_to_db(new_movies)
-                results = get_recommendations(query, language_code=intent['language_code'])
-                results = filter_results(results, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
+            # -- Only Rerank if it's actually worth it (> 5 results) --
+            if results and len(results['metadatas'][0]) > 5:
+                results = rerank_results(query, results)
+                
+            if results:
+                results_cache[query] = results
 
         # -- Generate and print response --
         if results:
@@ -384,6 +537,10 @@ def main():
             print(f"\nChatbot: {response}")
             # Store a compact version in history so the model knows what was shown
             _, context_summary = build_movies_text(results)
+            # Update last_movie_title if we found a specific title or just one result
+            if results['metadatas'][0]:
+                last_movie_title = results['metadatas'][0][0]['title']
+
             chat_history.append({
                 "role": "assistant",
                 "content": f"I recommended these movies:\n{context_summary}"
