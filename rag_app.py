@@ -63,6 +63,24 @@ chat_history = []   # List of {"role": "user"/"assistant", "content": "..."}
 results_cache = {}  # Cache query -> processed results
 last_movie_title = None # Tracks the most recently discussed movie title
 
+def is_specific_movie(query):
+    """Detect if the user is asking for a specific movie title."""
+    q = query.lower()
+    # patterns for movie search
+    if "movie" in q and ("called" in q or "named" in q or "about" in q):
+        return True
+    if len(query.split()) <= 5 and not any(k in q for k in ["suggest", "recommend", "show"]):
+        return True
+    return False
+
+def extract_movie_name(query):
+    """Extract the raw movie name from a natural language query."""
+    # Look for the last occurrence of these words to get the actual title
+    match = re.search(r".*(called|named|about|for)\s+(.*)", query.lower())
+    if match:
+        return match.group(2).strip()
+    return query
+
 def _llm(messages, model=CHAT_MODEL):
     """Call the configured LLM provider (Ollama or Groq)."""
     try:
@@ -360,17 +378,28 @@ def build_movies_text(search_results):
 
     return movies_text, "\n".join(context_lines)
 
-def generate_response(query, search_results):
+def generate_response(query, search_results, is_specific=False):
     movies_text, context_summary = build_movies_text(search_results)
 
-    # Advanced Generation: Reasoning over the context
-    summary_prompt = (
-        f"You are a movie expert who understands user moods and preferences.\n"
-        f"The user said: \"{query}\"\n"
-        f"You chose these movies based on their similarity, rating, and relevance:\n{context_summary}\n\n"
-        f"Explain in 3 sentences WHY these specific movies were selected for their request.\n"
-        f"Mention specific themes from the movies that match the user's mood."
-    )
+    if is_specific:
+        summary_prompt = (
+            f"User asked about a specific movie: \"{query}\"\n"
+            f"Retrieved movie data:\n{context_summary}\n\n"
+            f"Use ONLY the retrieved movie data above.\n"
+            f"Do NOT suggest other movies.\n"
+            f"Do NOT assume similarities to other films.\n"
+            f"Explain the movie briefly and naturally. 2-3 sentences max."
+        )
+    else:
+        # Advanced Generation: Reasoning over the context
+        summary_prompt = (
+            f"You are a movie expert who understands user moods and preferences.\n"
+            f"The user said: \"{query}\"\n"
+            f"You chose these movies based on their similarity, rating, and relevance:\n{context_summary}\n\n"
+            f"Explain in 3 sentences WHY these specific movies were selected for their request.\n"
+            f"Mention specific themes from the movies that match the user's mood."
+        )
+        
     messages  = chat_history + [{"role": "user", "content": summary_prompt}]
     commentary = _llm(messages, model=CHAT_MODEL) or "Based on your interest, I've selected these highly-rated matches:"
 
@@ -479,6 +508,12 @@ def main():
             if any(k in query.lower() for k in ["lite", "light", "stress", "tired", "relax", "fun", "happy"]):
                 intent['genre_id'] = GENRE_MAP.get("comedy")
                 
+        # -- Force Intent Override for Specific Titles --
+        if is_specific_movie(query) and intent['type'] != 'chat':
+            intent['type'] = 'search'
+            intent['keywords'] = extract_movie_name(query)
+            print(f"  [Intent] Overridden to 'search' for title: {intent['keywords']}")
+        
         print(f"  Intent: type={intent['type']}, lang={intent['language_code']}, genre={intent['genre_id']}, latest={intent['is_latest']}")
 
         # -- Handle simple chat/greetings --
@@ -489,43 +524,43 @@ def main():
             continue
 
         # -- Check Cache First --
+        results = None
         if query in results_cache:
             results = results_cache[query]
         else:
-            # -- Vector DB search --
-            results = get_recommendations(query, language_code=intent['language_code'])
-            results = filter_results(results, query=query, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
-            results = filter_by_mood(results, query) # Apply strict mood filtering
+            # -- Search Logic --
+            if intent['type'] == 'search':
+                # Skip vector DB for exact title search to ensure accuracy
+                keywords = intent['keywords'] or query
+                print(f"  Searching TMDB directly for exact title: '{keywords}'")
+                new_movies = search_movies(keywords)
+                if new_movies:
+                    add_movies_to_db(new_movies)
+                    results = get_recommendations(keywords) # Query specifically for the title
+                    if results:
+                        results = filter_results(results, query=keywords)
+            else:
+                # -- Discover Logic (Mood/Genre/etc) --
+                results = get_recommendations(query, language_code=intent['language_code'])
+                results = filter_results(results, query=query, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
+                results = filter_by_mood(results, query)
 
-            # -- Fallback to TMDB --
-            if not results or intent.get('person') or not check_relevance(query, results):
-                print("[Chatbot] Fetching more movies from TMDB...")
-                if intent['type'] == 'discover':
+                # Fallback if discovery failed
+                if not results or intent.get('person') or not check_relevance(query, results):
+                    print("[Chatbot] Fetching more discovery results from TMDB...")
                     sort_by  = "release_date.desc" if intent['is_latest'] else "popularity.desc"
                     year_gte = 2022 if intent['is_latest'] else None
                     person_id = get_person_id(intent['person']) if intent.get('person') else None
+                    new_movies = discover_movies(language_code=intent['language_code'], genre_id=intent['genre_id'], sort_by=sort_by, year_gte=year_gte, person_id=person_id, pages=3)
                     
-                    # Ensure genre_id is passed
-                    new_movies = discover_movies(
-                        language_code=intent['language_code'], 
-                        genre_id=intent['genre_id'], 
-                        sort_by=sort_by, 
-                        year_gte=year_gte, 
-                        person_id=person_id, 
-                        pages=3
-                    )
-                else:
-                    keywords   = intent['keywords'] or query
-                    new_movies = search_movies(keywords)
-
-                if new_movies:
-                    add_movies_to_db(new_movies)
-                    results = get_recommendations(query, language_code=intent['language_code'])
-                    results = filter_results(results, query=query, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
-                    results = filter_by_mood(results, query) # Re-apply mood filtering after TMDB fetch
+                    if new_movies:
+                        add_movies_to_db(new_movies)
+                        results = get_recommendations(query, language_code=intent['language_code'])
+                        results = filter_results(results, query=query, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
+                        results = filter_by_mood(results, query)
             
-            # -- Only Rerank if it's actually worth it (> 5 results) --
-            if results and len(results['metadatas'][0]) > 5:
+            # -- Only Rerank if discovery results (> 5 results) --
+            if results and intent['type'] == 'discover' and len(results['metadatas'][0]) > 5:
                 results = rerank_results(query, results)
                 
             if results:
@@ -533,7 +568,7 @@ def main():
 
         # -- Generate and print response --
         if results:
-            response = generate_response(query, results)
+            response = generate_response(query, results, is_specific=(intent['type'] == 'search'))
             print(f"\nChatbot: {response}")
             # Store a compact version in history so the model knows what was shown
             _, context_summary = build_movies_text(results)
