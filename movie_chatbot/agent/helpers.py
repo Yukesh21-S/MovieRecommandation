@@ -327,6 +327,13 @@ def is_followup(query: str, history: list[dict]) -> bool:
     if not history:
         return False
     lower_query = query.lower().strip()
+
+    # If user refers to an item number/ordinal and mentions the list/above,
+    # it's almost certainly a follow-up to the previous recommendations.
+    idx = extract_requested_index(query)
+    if idx is not None and any(token in lower_query for token in ["list", "above", "recommendations", "suggestions"]):
+        return True
+
     if any(hint in lower_query for hint in FOLLOWUP_HINTS) and len(query.split()) < 15:
         return True
     if len(query.split()) <= 4:
