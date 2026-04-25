@@ -1,397 +1,498 @@
-import chromadb
-from chromadb.utils import embedding_functions
-import ollama
-import re
-import json as _json
-import sys
-import os
-from dotenv import load_dotenv
-from groq import Groq
+"""
+agent.py
+LangGraph-powered movie chatbot agent.
 
-from data_fetcher import search_movies, discover_movies, get_person_id, LANGUAGE_MAP, GENRE_MAP
-from vector_engine import add_movies_to_db
+Graph flow:
+  classify → chat        (greetings / small talk)
+           → followup    (questions about previously shown movies)
+           → search_movie → respond_search   (specific title lookup)
+           → retrieve    → fetch_discover? → respond_discover
+"""
+
+import os
+import re
+from typing import Literal, TypedDict
+
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import StateGraph, END
+
+import data_fetcher as tmdb
+import vector_engine as vdb
 
 load_dotenv()
 
-# Mood to Genre mapping for TMDB discover
-MOOD_MAP = {
-    "motivation": "drama",
-    "motivational": "drama",
-    "inspire": "drama",
-    "inspiration": "drama",
-    "inspirational": "drama",
-    "feel good": "comedy",
-    "sad": "drama",
-    "happy": "comedy",
-    "better": "comedy",
-    "excited": "action",
-    "scared": "horror",
-    "romantic": "romance"
+# ── LLM setup ─────────────────────────────────────────────────────────────────
+
+_llm = ChatGroq(
+    model=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
+    api_key=os.getenv("GROQ_API_KEY"),
+    temperature=0.3,
+)
+
+_json_llm = ChatGroq(
+    model=os.getenv("LLM_MODEL", "llama-3.1-8b-instant"),
+    api_key=os.getenv("GROQ_API_KEY"),
+    temperature=0,
+)
+
+# ── Lookup maps ───────────────────────────────────────────────────────────────
+
+MOOD_TO_GENRE: dict[str, str] = {
+    "motivat": "drama", "inspir": "drama",
+    "stress": "comedy", "tired": "comedy", "relax": "comedy",
+    "fun": "comedy", "funny": "comedy", "happy": "comedy", "feel good": "comedy",
+    "sad": "drama", "excited": "action", "scared": "horror", "romantic": "romance",
 }
 
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+LITE_MOOD_KEYWORDS = {"lite", "light", "stress", "stressed", "tired", "relax",
+                      "fun", "happy", "feel good", "chill", "lighthearted"}
+LITE_GENRES = {"comedy", "family", "romance", "animation"}
 
-# ── Single embedding function used everywhere ──────────────────────────────
-st_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
-# ── Configuration ────────────────────────────────────────────────────────
-DB_PATH = "./chroma_db"
-COLLECTION_NAME = "movie_collection"
+LATEST_KEYWORDS = {"latest", "new", "recent", "newest", "2022", "2023", "2024", "2025"}
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+FOLLOWUP_HINTS = {
+    "first", "second", "third", "fourth", "fifth",
+    "that movie", "those movies", "tell me more", "more about",
+    "what about", "elaborate", "details", "explain", "describe",
+    "movie 1", "movie 2", "movie 3", "number", "plot", "story",
+    "who directed", "who acted", "stars in", "rating of", "overview of",
+    "which one", "the one", "is it good", "worth watching",
+    "how is it", "about it", "see it", "watch it",
+}
 
-if LLM_PROVIDER == "groq" and GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    INTENT_MODEL = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
-    CHAT_MODEL = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
-else:
-    INTENT_MODEL = "phi3:mini"
-    CHAT_MODEL = "gemma2:2b"
+# Distance threshold: above this = not a real match for a title search
+SEARCH_DISTANCE_THRESHOLD = 0.45
 
-# ── Conversation memory (persists for the whole session) ───────────────────
-chat_history = []   # List of {"role": "user"/"assistant", "content": "..."}
+# ── State ─────────────────────────────────────────────────────────────────────
 
-def _llm(messages, model=CHAT_MODEL):
-    """Call the configured LLM provider (Ollama or Groq)."""
-    try:
-        if LLM_PROVIDER == "groq" and GROQ_API_KEY:
-            completion = groq_client.chat.completions.create(
-                model=model,
-                messages=messages
-            )
-            return completion.choices[0].message.content.strip()
-        else:
-            response = ollama.chat(model=model, messages=messages)
-            return response['message']['content'].strip()
-    except Exception as e:
-        print(f"  LLM Error ({LLM_PROVIDER}): {e}")
-        return None
+class State(TypedDict):
+    query: str
+    history: list[dict]
 
-def get_collection():
-    client = chromadb.PersistentClient(path=DB_PATH)
-    try:
-        return client.get_collection(name=COLLECTION_NAME, embedding_function=st_ef)
-    except Exception:
-        return None
+    # Populated by classify
+    intent: Literal["chat", "search", "discover", "followup"]
+    search_title: str | None     # extracted clean title for search queries
+    language_code: str | None
+    genre_id: int | None
+    person: str | None
+    is_latest: bool
+    is_lite_mood: bool
 
-def get_recommendations(query, language_code=None, n_results=15):  # fetch more so filtering still leaves 10
-    col = get_collection()
-    if col is None:
-        return None
-    
-    query_params = {
-        "query_texts": [query],
-        "n_results": n_results
-    }
-    if language_code:
-        query_params["where"] = {"language": language_code}
-        
-    results = col.query(**query_params)
-    if not results['documents'][0]:
-        return None
-    return results
+    # Populated by retrieve nodes
+    movies: list[dict]
 
-def filter_results(results, min_year=None, min_rating=None, max_results=10):
-    """Post-filter ChromaDB results by year and rating."""
-    if results is None:
-        return None
-    filtered = {'documents': [[]], 'metadatas': [[]], 'distances': [[]]}
-    for i, meta in enumerate(results['metadatas'][0]):
-        rating = meta.get('vote_average', 0.0)
-        release = meta.get('release_date', '') or ''
-        year = int(release[:4]) if release and len(release) >= 4 and release[:4].isdigit() else 0
+    # Output
+    response: str
 
-        if min_rating and rating < min_rating:
-            continue
-        if min_year and year < min_year:
-            continue
 
-        filtered['documents'][0].append(results['documents'][0][i])
-        filtered['metadatas'][0].append(meta)
-        filtered['distances'][0].append(results['distances'][0][i])
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-        if len(filtered['documents'][0]) >= max_results:
-            break
+def _extract_title(query: str) -> str:
+    """Strip common search phrases to get the bare movie title."""
+    q = query.strip()
+    for prefix in [
+        "find ", "search for ", "look up ", "tell me about ", "what is ",
+        "what's ", "show me ", "about the movie ", "the movie ", "movie called ",
+        "movie named ", "film called ", "film named ",
+    ]:
+        if q.lower().startswith(prefix):
+            q = q[len(prefix):]
+    # Remove trailing question marks
+    return q.rstrip("?").strip()
 
-    return filtered if filtered['documents'][0] else None
 
-def check_relevance(query, search_results):
-    """Ask the LLM — using conversation history — if results match the query."""
-    context = "\n".join(
-        search_results['metadatas'][0][i]['title']
-        for i in range(min(5, len(search_results['metadatas'][0])))
-    )
-    messages = [{
-        "role": "user",
-        "content": (
-            f"You are a strict relevance evaluator.\n"
-            f"User query: \"{query}\"\n"
-            f"Retrieved movies:\n{context}\n\n"
-            f"Do these movies clearly and specifically match the user's request?\n"
-            f"If the user asked for a specific actor or director, and their name is NOT in the retrieved movies, you MUST answer NO.\n"
-            f"Answer exactly YES or NO."
+def _format_movies(movies: list[dict]) -> str:
+    lines = []
+    for i, m in enumerate(movies, 1):
+        year = (m.get("release_date") or "")[:4] or "?"
+        lines.append(
+            f"{i}. {m['title']} ({year}) | {m['genres']} | ⭐ {m['vote_average']}/10\n"
+            f"   {m.get('overview', '')[:200]}"
         )
-    }]
-    answer = _llm(messages, model=INTENT_MODEL) or "YES"
-    return "YES" in answer.upper()
+    return "\n\n".join(lines)
 
-def extract_query_intent(query):
-    """Detect if user wants discover (language/genre) or title search, and if 'latest'."""
-    LATEST_WORDS = ["latest", "new", "recent", "newest", "2024", "2025", "2023", "2022"]
-    DISCOVER_KEYWORDS = ["suggest", "recommend", "movies", "feel", "sad", "happy", "motivation", "motivational", "inspire", "inspiration", "best", "top", "good"]
-    
-    query_lower = query.lower()
-    is_latest = any(w in query_lower for w in LATEST_WORDS)
-    is_recommendation = any(k in query_lower for k in DISCOVER_KEYWORDS) or len(query.split()) > 4
 
-    lang_list  = ", ".join(LANGUAGE_MAP.keys())
-    genre_list = ", ".join(GENRE_MAP.keys())
+def _results_to_movies(results: dict) -> list[dict]:
+    movies = []
+    for i, meta in enumerate(results["metadatas"][0]):
+        doc = results["documents"][0][i]
+        overview = doc.split("Overview: ", 1)[-1] if "Overview: " in doc else doc
+        movies.append({**meta, "overview": overview, "distance": results["distances"][0][i]})
+    return movies
 
-    prompt = f"""
-Classify the user movie query into ONE of these types:
-1. "search" -> if they are asking for a SPECIFIC movie title (e.g. "find Inception")
-2. "discover" -> if they want recommendations based on mood, genre, language, or person (e.g. "suggest motivational movies")
-3. "chat" -> if they are just greeting you (e.g. "hi", "hello"), asking how you are, or making small talk.
 
-Rules:
-- If the query is just a greeting (hi, hello, etc.) -> ALWAYS "chat"
-- If the query is a full sentence or contains words like "suggest", "recommend", "mood", "feel" -> ALWAYS "discover"
-- Only use "search" if it's clearly a specific movie name or very short (1-3 words) title request.
+def _rank_discover(movies: list[dict], query: str, lite_mood: bool = False) -> list[dict]:
+    """Rank movies for discover queries; optionally enforce lite-genre filter."""
+    query_words = set(re.findall(r"\w+", query.lower()))
+    scored = []
+    for m in movies:
+        genres = m.get("genres", "").lower()
+        if lite_mood and not any(g in genres for g in LITE_GENRES):
+            continue
+        sim = max(0.0, 1.0 - m.get("distance", 1.0))
+        rating_score = m.get("vote_average", 0) / 10.0
+        keyword_boost = 0.3 if query_words & set(re.findall(r"\w+", m["title"].lower())) else 0.0
+        comedy_boost = 0.2 if "comedy" in genres else 0.0
+        scored.append({**m, "_score": sim * 0.5 + rating_score * 0.3 + keyword_boost + comedy_boost})
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    return scored[:10]
 
-Return a JSON object with:
-- "type": "discover", "search", or "chat"
-- "language": one of ({lang_list}) or null
-- "genre": one of ({genre_list}) or null
-- "person": name of director/actor or null
-- "keywords": specific movie title keywords if type is "search", else null
 
-User query: "{query}"
-JSON:"""
+def _title_words(title: str) -> set[str]:
+    """Meaningful words in a title — strips articles and single chars."""
+    stop = {"a", "an", "the", "of", "in", "on", "at", "to", "and", "or"}
+    return {w for w in re.findall(r"[a-z0-9]+", title.lower()) if w not in stop and len(w) > 1}
 
-    intent = {
-        'type': 'discover' if is_recommendation else 'search', 
-        'language_code': None,
-        'genre_id': None, 'person': None, 'keywords': None, 'is_latest': is_latest
-    }
 
-    # Manual Greeting check
-    if query_lower in ["hi", "hello", "hey", "hola", "namaste"]:
-        intent['type'] = 'chat'
-        return intent
+def _find_exact_title(title: str, movies: list[dict]) -> dict | None:
+    """
+    Return a DB movie ONLY when there is a confident title match.
+    Returns None so the caller hits TMDB instead of showing a wrong movie.
+    """
+    title_lower = title.lower().strip()
+    search_words = _title_words(title)
 
-    # Manual Mood Mapping
-    for mood, genre in MOOD_MAP.items():
-        if mood in query_lower:
-            intent['genre_id'] = GENRE_MAP.get(genre)
-            intent['type'] = 'discover'
+    for m in movies:
+        db_title = m["title"].lower().strip()
+        db_words = _title_words(m["title"])
 
-    # Try LLM intent detection (do NOT include chat history, it confuses the JSON output)
-    messages = [{"role": "user", "content": prompt}]
-    content = _llm(messages, model=INTENT_MODEL)
-    if content:
-        match = re.search(r'\{.*?\}', content, re.DOTALL)
-        if match:
-            try:
-                parsed    = _json.loads(match.group())
-                lang_name  = (parsed.get('language') or '').lower()
-                genre_name = (parsed.get('genre')    or '').lower()
-                
-                # Update intent with LLM results, but respect manual overrides for type
-                intent.update({
-                    'type':          parsed.get('type', intent['type']),
-                    'language_code': LANGUAGE_MAP.get(lang_name) or intent['language_code'],
-                    'genre_id':      GENRE_MAP.get(genre_name) or intent['genre_id'],
-                    'person':        parsed.get('person'),
-                    'keywords':      parsed.get('keywords'),
-                })
-                
-                # Double check for recommendation intent
-                if is_recommendation:
-                    intent['type'] = 'discover'
-                
-                return intent
-            except Exception:
-                pass
+        # Rule 1: exact full-title match
+        if db_title == title_lower:
+            return m
 
-    # Keyword fallback
-    for lang_name, lang_code in LANGUAGE_MAP.items():
-        if lang_name in query_lower:
-            intent['language_code'] = lang_code
-            intent['type'] = 'discover'
-            
-    if not intent['keywords'] and intent['type'] == 'search':
-        intent['keywords'] = query
-        
-    return intent
+        # Rule 2: all search words present in DB title with similar word count
+        # Prevents "I" matching "Inception" (single-char words are stripped)
+        if search_words and search_words.issubset(db_words):
+            ratio = len(db_words) / max(len(search_words), 1)
+            if ratio <= 2.0:
+                return m
 
-def build_movies_text(search_results):
-    """Format all retrieved movies into a clean structured block."""
-    movies_text = ""
-    context_lines = []
-    for i, doc in enumerate(search_results['documents'][0]):
-        meta     = search_results['metadatas'][0][i]
-        title    = meta['title']
-        genres   = meta['genres']
-        rating   = meta['vote_average']
-        release  = meta.get('release_date', 'Unknown')
-        year     = release[:4] if release and release != 'Unknown' else '???'
-        overview = doc.split("Overview: ")[1] if "Overview: " in doc else doc
+    # Rule 3: very tight vector distance (nearly identical)
+    best = min(movies, key=lambda m: m.get("distance", 1.0), default=None)
+    if best and best.get("distance", 1.0) < 0.18:
+        return best
 
-        movies_text += (
-            f"{i+1}. {title} ({year})\n"
-            f"   Genre   : {genres}\n"
-            f"   Rating  : {rating}/10\n"
-            f"   Overview: {overview}\n\n"
-        )
-        context_lines.append(f"{i+1}. {title} ({year}) | {genres} | {rating}/10")
+    return None  # → caller will fetch from TMDB
 
-    return movies_text, "\n".join(context_lines)
 
-def generate_response(query, search_results):
-    movies_text, context_summary = build_movies_text(search_results)
-
-    # Add conversation history + current context to get a relevant intro
-    summary_prompt = (
-        f"You are a friendly movie recommendation assistant.\n"
-        f"The user asked: \"{query}\"\n"
-        f"You found these movies:\n{context_summary}\n\n"
-        f"Write a SHORT 2-3 sentence friendly intro. Do NOT list the movies again."
+def _build_messages(system: str, history: list[dict], user_msg: str) -> list:
+    return (
+        [SystemMessage(content=system)]
+        + [HumanMessage(content=m["content"]) if m["role"] == "user"
+           else AIMessage(content=m["content"])
+           for m in history[-6:]]
+        + [HumanMessage(content=user_msg)]
     )
-    messages  = chat_history + [{"role": "user", "content": summary_prompt}]
-    commentary = _llm(messages, model=CHAT_MODEL) or "Here are the movies I found for you:"
 
-    return f"{commentary}\n\n{movies_text}"
 
-def handle_followup(query):
-    """Handle follow-up questions using only the conversation history (no DB search needed)."""
-    messages = chat_history + [{"role": "user", "content": query}]
-    return _llm(messages, model=CHAT_MODEL) or "I'm not sure — could you rephrase your question?"
-
-def is_followup(query):
-    """Detect if the user is asking a follow-up about previously mentioned movies."""
-    FOLLOWUP_HINTS = [
-        "first", "second", "third", "that", "those", "it", "them", "him", "her",
-        "movie", "film", "story", "plot", "elaborate", "details", "more",
-        "movie 1", "movie 2", "movie 3", "number", "tell me more",
-        "what about", "and the", "overview of", "rating of", "which one",
-        "who directed", "who acted", "stars in"
-    ]
+def _is_followup(query: str, history: list[dict]) -> bool:
+    if not history:
+        return False
     q = query.lower().strip()
-    
-    # 1. Direct keyword hints
-    if "the movie" in q or "the story" in q or "the plot" in q:
+    if any(hint in q for hint in FOLLOWUP_HINTS) and len(query.split()) < 15:
         return True
-    if any(h in q for h in FOLLOWUP_HINTS) and len(query.split()) < 20:
-        return True
-
-    # 2. Check if the query is a title of a movie we just mentioned
-    # We look for the last 'assistant' message that contains our recommendation list
-    for msg in reversed(chat_history[:-1]): # Exclude the current user message
-        if msg['role'] == 'assistant' and 'I recommended these movies:' in msg['content']:
-            content = msg['content'].lower()
-            # If the user typed something that is exactly in our list (like "Leo")
-            # We use word boundaries to avoid matching "in" within "inception"
-            if re.search(rf"\b{re.escape(q)}\b", content):
-                return True
-            break
-            
+    if len(query.split()) <= 4:
+        for msg in reversed(history):
+            if msg["role"] == "assistant":
+                if q in msg["content"].lower():
+                    return True
+                break
     return False
 
-def main():
-    print("================================================")
-    print(f"  🎬 Movie Chatbot ({LLM_PROVIDER.upper()}) 🎬")
-    print("================================================")
-    if LLM_PROVIDER == "groq":
-        print(f"  Using Cloud Model: {CHAT_MODEL}")
-    else:
-        print(f"  Using Local Models: {INTENT_MODEL} + {CHAT_MODEL}")
-    print("================================================")
-    print("  Ask anything! e.g. 'latest hindi movies'")
-    print("  Follow-up: 'tell me more about the first one'")
-    print("  Type 'quit' to exit.")
-    print("================================================\n")
 
-    while True:
-        query = input("You: ").strip()
-        if not query:
-            continue
-        if query.lower() in ['quit', 'exit', 'q']:
-            print("Goodbye! 🎬")
+# ── Graph nodes ───────────────────────────────────────────────────────────────
+
+def classify(state: State) -> State:
+    query, history = state["query"], state["history"]
+    q = query.lower()
+
+    is_latest = bool(LATEST_KEYWORDS & set(q.split()))
+    is_lite = bool(LITE_MOOD_KEYWORDS & set(q.split()))
+
+    # Priority 1: follow-up
+    if _is_followup(query, history):
+        return {**state, "intent": "followup", "search_title": None, "language_code": None,
+                "genre_id": None, "person": None, "is_latest": False, "is_lite_mood": False}
+
+    # Priority 2: greeting
+    if q.strip() in {"hi", "hello", "hey", "hola", "namaste"} or \
+       ("how are you" in q and "movie" not in q):
+        return {**state, "intent": "chat", "search_title": None, "language_code": None,
+                "genre_id": None, "person": None, "is_latest": is_latest, "is_lite_mood": False}
+
+    # Priority 3: LLM classification
+    lang_list = ", ".join(tmdb.LANGUAGE_MAP)
+    genre_list = ", ".join(tmdb.GENRE_MAP)
+    prompt = f"""Classify this movie query. Respond ONLY with valid JSON — no markdown, no explanation.
+
+Query: "{query}"
+
+Rules:
+- "search"   → user wants info about ONE specific movie by title (e.g. "Find Inception", "Tell me about Parasite")
+- "discover" → user wants recommendations by mood, genre, language, or person
+- "chat"     → greeting or small talk only
+
+JSON:
+{{
+  "intent": "chat" | "search" | "discover",
+  "title": exact movie title if intent=search else null,
+  "language": one of [{lang_list}] or null,
+  "genre": one of [{genre_list}] or null,
+  "person": actor/director name or null
+}}"""
+
+    try:
+        import json as _json
+        resp = _json_llm.invoke([HumanMessage(content=prompt)])
+        match = re.search(r"\{.*?\}", resp.content, re.DOTALL)
+        parsed = _json.loads(match.group()) if match else {}
+    except Exception:
+        parsed = {}
+
+    lang_code = tmdb.LANGUAGE_MAP.get((parsed.get("language") or "").lower())
+    genre_id = tmdb.GENRE_MAP.get((parsed.get("genre") or "").lower())
+
+    for kw, genre_name in MOOD_TO_GENRE.items():
+        if kw in q and not genre_id:
+            genre_id = tmdb.GENRE_MAP.get(genre_name)
             break
 
-        # -- Add user message to history --
-        chat_history.append({"role": "user", "content": query})
+    intent = parsed.get("intent", "discover")
+    # Extract title: prefer LLM-parsed title, fall back to stripping the query manually
+    search_title = None
+    if intent == "search":
+        search_title = parsed.get("title") or _extract_title(query)
 
-        # -- Check if it's a follow-up question --
-        if is_followup(query) and len(chat_history) > 2:
-            print("[Chatbot] Answering follow-up from conversation memory...")
-            response = handle_followup(query)
-            print(f"\nChatbot: {response}\n")
-            chat_history.append({"role": "assistant", "content": response})
-            continue
+    return {
+        **state,
+        "intent": intent,
+        "search_title": search_title,
+        "language_code": lang_code,
+        "genre_id": genre_id,
+        "person": parsed.get("person"),
+        "is_latest": is_latest,
+        "is_lite_mood": is_lite,
+    }
 
-        # -- Extract Intent FIRST so we know the language --
-        intent = extract_query_intent(query)
-        print(f"  Intent: type={intent['type']}, lang={intent['language_code']}, genre={intent['genre_id']}, latest={intent['is_latest']}")
 
-        # -- Handle simple chat/greetings --
-        if intent['type'] == 'chat':
-            response = handle_followup(query)
-            print(f"\nChatbot: {response}\n")
-            chat_history.append({"role": "assistant", "content": response})
-            continue
+def search_movie(state: State) -> State:
+    """
+    Handle specific title searches.
+    1. Always clean the title first (strip "Find", "Tell me about", etc).
+    2. Check vector DB — only accept a confident title match.
+    3. If not found → call TMDB search API (real fallback).
+    4. Return only the matched movie, never unrelated results.
+    """
+    # Always use the cleaned title for both DB lookup and TMDB search
+    raw_title = state["search_title"] or state["query"]
+    title = _extract_title(raw_title)          # strips "Find ", "Tell me about ", etc.
+    print(f"[Search] Looking for title: '{title}'")
 
-        # -- Vector DB search with language filter --
-        results = get_recommendations(query, language_code=intent['language_code'])
-        results = filter_results(results, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
+    # Step 1: check vector DB with strict matching
+    results = vdb.query_movies(title, n_results=10)
+    if results:
+        candidates = _results_to_movies(results)
+        match = _find_exact_title(title, candidates)
+        if match:
+            print(f"[Search] Found in DB: {match['title']}")
+            return {**state, "movies": [match]}
 
-        # -- Fallback to TMDB if DB results are not relevant, or if a specific person was requested --
-        if not results or intent.get('person') or not check_relevance(query, results):
-            print("[Chatbot] Fetching more movies from TMDB...")
-            
-            if intent['type'] == 'discover':
-                sort_by  = "release_date.desc" if intent['is_latest'] else "popularity.desc"
-                year_gte = 2022 if intent['is_latest'] else None
-                person_id = None
-                if intent.get('person'):
-                    person_id = get_person_id(intent['person'])
-                    print(f"  Resolved person '{intent['person']}' to ID: {person_id}")
+    # Step 2: TMDB API fallback — movie not confidently found in DB
+    print(f"[Search] Not in DB → fetching from TMDB API…")
+    new_movies = tmdb.search_movies(title)
+    if new_movies:
+        vdb.upsert_movies(new_movies)
+        # Pick the best match: prefer word-level title match, fallback to top result
+        search_words = _title_words(title)
+        close = [m for m in new_movies if search_words and search_words.issubset(_title_words(m["title"]))]
+        if not close:
+            close = new_movies[:1]   # TMDB returns results sorted by relevance; top = best
+        print(f"[Search] TMDB returned: {close[0]['title']}")
+        return {**state, "movies": close}
 
-                new_movies = discover_movies(
-                    language_code=intent['language_code'],
-                    genre_id=intent['genre_id'],
-                    sort_by=sort_by,
-                    year_gte=year_gte,
-                    person_id=person_id,
-                    pages=3
-                )
-            else:
-                keywords   = intent['keywords'] or query
-                print(f"  Searching TMDB by title: '{keywords}'")
-                new_movies = search_movies(keywords)
+    return {**state, "movies": []}
 
-            if new_movies:
-                add_movies_to_db(new_movies)
-                results = get_recommendations(query, language_code=intent['language_code'])
-                results = filter_results(results, min_year=2022 if intent['is_latest'] else None, min_rating=0.1)
 
-        # -- Generate and print response --
-        if results:
-            response = generate_response(query, results)
-            print(f"\nChatbot: {response}")
-            # Store a compact version in history so the model knows what was shown
-            _, context_summary = build_movies_text(results)
-            chat_history.append({
-                "role": "assistant",
-                "content": f"I recommended these movies:\n{context_summary}"
-            })
-        else:
-            msg = "Sorry, I couldn't find any movies matching your request. Try rephrasing!"
-            print(f"\nChatbot: {msg}\n")
-            chat_history.append({"role": "assistant", "content": msg})
+def retrieve(state: State) -> State:
+    """Semantic vector search for discover queries."""
+    results = vdb.query_movies(state["query"], language_code=state["language_code"])
+    movies = _rank_discover(
+        _results_to_movies(results), state["query"], lite_mood=state["is_lite_mood"]
+    ) if results else []
+    return {**state, "movies": movies}
 
-if __name__ == "__main__":
-    main()
+
+def fetch_discover(state: State) -> State:
+    """Fallback for discover: hit TMDB discover API, then re-query."""
+    print("[Fallback] Fetching discover results from TMDB…")
+    sort = "release_date.desc" if state["is_latest"] else "popularity.desc"
+    person_id = tmdb.get_person_id(state["person"]) if state.get("person") else None
+    new_movies = tmdb.discover_movies(
+        language_code=state["language_code"],
+        genre_id=state["genre_id"],
+        sort_by=sort,
+        year_gte=2022 if state["is_latest"] else None,
+        person_id=person_id,
+        pages=3,
+    )
+    vdb.upsert_movies(new_movies)
+    results = vdb.query_movies(state["query"], language_code=state["language_code"])
+    movies = _rank_discover(
+        _results_to_movies(results), state["query"], lite_mood=state["is_lite_mood"]
+    ) if results else []
+    return {**state, "movies": movies}
+
+
+def respond_search(state: State) -> State:
+    """Respond to a specific movie search — show only the matched movie."""
+    movies, query, history = state["movies"], state["query"], state["history"]
+    title = state["search_title"] or query
+
+    if not movies:
+        return {**state, "response": (
+            f"Sorry, I couldn't find **{title}** anywhere. "
+            "Please check the spelling or try a different title."
+        )}
+
+    movie = movies[0]
+    movie_block = _format_movies([movie])
+
+    system = (
+        "You are a movie expert. The user asked about a specific movie. "
+        "Use ONLY the data provided below to answer. "
+        "Give a brief, natural 2–3 sentence description covering genre, plot, and why it's worth watching. "
+        "Do NOT mention other movies."
+    )
+    user_msg = f'User asked about: "{title}"\n\nMovie data:\n{movie_block}'
+    commentary = _llm.invoke(_build_messages(system, history, user_msg)).content.strip()
+    return {**state, "response": f"{commentary}\n\n{movie_block}"}
+
+
+def respond_discover(state: State) -> State:
+    """Respond to a discover/recommendation query with up to 10 movies."""
+    movies, query, history = state["movies"], state["query"], state["history"]
+
+    if not movies:
+        return {**state, "response": "Sorry, I couldn't find matching movies. Try rephrasing!"}
+
+    movie_block = _format_movies(movies)
+    system = (
+        "You are a friendly movie recommender. In 2–3 sentences, explain why "
+        "the movies below match the user's mood or request. "
+        "Do NOT invent movies — refer only to the list given."
+    )
+    user_msg = f'User request: "{query}"\n\nMatched movies:\n{movie_block}'
+    commentary = _llm.invoke(_build_messages(system, history, user_msg)).content.strip()
+    return {**state, "response": f"{commentary}\n\n{movie_block}"}
+
+
+def followup(state: State) -> State:
+    """Answer follow-up questions using only conversation history."""
+    system = (
+        "You are a movie expert. The conversation history contains recommended movies. "
+        "Answer the user's follow-up question using ONLY movies already in the history. "
+        "Be concise (2–4 sentences). Do NOT suggest new movies unless explicitly asked."
+    )
+    response = _llm.invoke(_build_messages(system, state["history"], state["query"])).content.strip()
+    return {**state, "response": response}
+
+
+def chat(state: State) -> State:
+    """Handle greetings and small talk."""
+    system = "You are a friendly movie chatbot. Keep answers brief and warm."
+    response = _llm.invoke(_build_messages(system, state["history"], state["query"])).content.strip()
+    return {**state, "response": response}
+
+
+# ── Routing ───────────────────────────────────────────────────────────────────
+
+def _route_intent(state: State) -> Literal["chat", "followup", "search_movie", "retrieve"]:
+    intent = state["intent"]
+    if intent == "chat":        return "chat"
+    if intent == "followup":    return "followup"
+    if intent == "search":      return "search_movie"
+    return "retrieve"
+
+
+def _needs_discover_fallback(state: State) -> Literal["fetch_discover", "respond_discover"]:
+    return "fetch_discover" if len(state["movies"]) < 3 else "respond_discover"
+
+
+# ── Build graph ───────────────────────────────────────────────────────────────
+
+def build_graph() -> StateGraph:
+    g = StateGraph(State)
+
+    g.add_node("classify",        classify)
+    g.add_node("search_movie",    search_movie)
+    g.add_node("retrieve",        retrieve)
+    g.add_node("fetch_discover",  fetch_discover)
+    g.add_node("respond_search",  respond_search)
+    g.add_node("respond_discover",respond_discover)
+    g.add_node("followup",        followup)
+    g.add_node("chat",            chat)
+
+    g.set_entry_point("classify")
+    g.add_conditional_edges("classify",  _route_intent)
+    g.add_edge("search_movie",           "respond_search")   # always go straight to respond
+    g.add_conditional_edges("retrieve",  _needs_discover_fallback)
+    g.add_edge("fetch_discover",         "respond_discover")
+    g.add_edge("respond_search",         END)
+    g.add_edge("respond_discover",       END)
+    g.add_edge("followup",               END)
+    g.add_edge("chat",                   END)
+
+    return g.compile()
+
+
+_graph = build_graph()
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def run(query: str, history: list[dict] | None = None) -> tuple[str, list[dict]]:
+    """
+    Run one chatbot turn.
+
+You: Find Inception
+[Search] Looking for title: 'Inception'
+[Search] Not in DB → fetching from TMDB API…
+[TMDB] Searching for 'Inception'…
+[TMDB] Found 12 movies.
+[VectorDB] Upserted 12 movies.
+[Search] TMDB returned: Inception
+
+Chatbot: Inception is a mind-bending action film that delves into the world of dream-sharing, where a skilled thief, Cobb, is tasked with planting an idea in someone's mind instead of stealing one. As he navigates the complex layers of his own subconscious, Cobb must confront his past and the blurred lines between reality and dreams. With its thought-provoking premise and stunning visuals, Inception is a thrilling ride that will keep you on the edge of your seat.
+
+1. Inception (2010) | Action, Science Fiction, Adventure | ⭐ 8.372/10
+   Cobb, a skilled thief who commits corporate espionage by infiltrating the subconscious of his targets is offered a chance to regain his old life as payment for a task considered to be impossible: "inc
+
+    Args:
+        query:   User message.
+        history: Previous [{"role": ..., "content": ...}] turns.
+
+    Returns:
+        (response_text, updated_history)
+    """
+    history = history or []
+    final_state = _graph.invoke({
+        "query": query,
+        "history": history,
+        "intent": "discover",
+        "search_title": None,
+        "language_code": None,
+        "genre_id": None,
+        "person": None,
+        "is_latest": False,
+        "is_lite_mood": False,
+        "movies": [],
+        "response": "",
+    })
+    response = final_state["response"]
+    updated_history = history + [
+        {"role": "user",      "content": query},
+        {"role": "assistant", "content": response},
+    ]
+    return response, updated_history

@@ -1,50 +1,64 @@
+"""
+main.py
+Entry point for the Movie Chatbot.
+
+Run:  python main.py
+"""
+
 import os
 import sys
 
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stdout.encoding != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 
-def initialize_system():
-    """Check if the vector DB exists, build it if not."""
-    import chromadb
-    from chromadb.utils import embedding_functions
-    
-    st_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    client = chromadb.PersistentClient(path="./chroma_db")
-    
-    try:
-        # Check if collection exists and has data
-        col = client.get_collection(name="movie_collection", embedding_function=st_ef)
-        count = col.count()
-        if count > 0:
-            print(f"  Vector DB ready with {count} movies.")
-            return
-        else:
-            raise Exception("Empty collection")
-    except Exception:
-        print("  First time setup: Building the vector database with sentence_transformers...")
-        # Delete old incompatible collection if any
+
+def _ensure_db_ready() -> None:
+    """Build the vector DB on first run; skip if already populated."""
+    import vector_engine as vdb
+    import data_fetcher as tmdb
+
+    col = vdb.get_collection()
+    if col and col.count() > 0:
+        print(f"[Setup] Vector DB ready ({col.count()} movies).")
+        return
+
+    print("[Setup] First run — building vector database…")
+    if not os.path.exists("movies_data.json"):
+        tmdb.fetch_and_save_diverse_movies()
+    vdb.setup_vector_db()
+    print("[Setup] Done.")
+
+
+def main() -> None:
+    _ensure_db_ready()
+
+    from agent import run  # import after DB is ready
+
+    history: list[dict] = []
+
+    print("\n" + "=" * 50)
+    print("   🎬  Movie Chatbot (LangGraph + Groq)  🎬")
+    print("=" * 50)
+    print("  Ask anything, e.g. 'latest Tamil movies'")
+    print("  Type 'quit' to exit.")
+    print("=" * 50 + "\n")
+
+    while True:
         try:
-            client.delete_collection(name="movie_collection")
-        except Exception:
-            pass
+            query = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye! 🎬")
+            break
 
-        import data_fetcher
-        import vector_engine
+        if not query:
+            continue
+        if query.lower() in {"quit", "exit", "q"}:
+            print("Goodbye! 🎬")
+            break
 
-        if not os.path.exists("movies_data.json"):
-            print("  Fetching initial movie data from TMDB...")
-            data_fetcher.fetch_movies(pages=5)
+        response, history = run(query, history)
+        print(f"\nChatbot: {response}\n")
 
-        vector_engine.setup_vector_db()
-        print("  Setup complete!")
-
-def main():
-    print("Initializing Movie Chatbot...")
-    initialize_system()
-
-    import rag_app
-    rag_app.main()
 
 if __name__ == "__main__":
     main()

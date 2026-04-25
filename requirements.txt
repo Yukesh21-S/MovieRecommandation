@@ -1,3 +1,19 @@
-requests
-chromadb
-ollama
+# Movie Chatbot - Requirements
+# Install with: pip install -r requirements.txt
+
+# ── LLM & Agent Framework ─────────────────────────────────────────────────────
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0
+langgraph>=0.2.0
+groq>=0.9.0
+
+# ── Vector Database ───────────────────────────────────────────────────────────
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# ── TMDB API ──────────────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Environment & Config ──────────────────────────────────────────────────────
+python-dotenv>=1.0.0

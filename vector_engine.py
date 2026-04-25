@@ -1,104 +1,102 @@
+"""
+vector_engine.py
+ChromaDB vector store for semantic movie search.
+"""
+
 import json
 import chromadb
 from chromadb.utils import embedding_functions
 
-# Use SentenceTransformers for embeddings
-st_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+DB_PATH = "./chroma_db"
+COLLECTION_NAME = "movie_collection"
 
-def setup_vector_db(json_file="movies_data.json", db_path="./chroma_db"):
-    print(f"Loading data from {json_file}...")
-    try:
-        with open(json_file, "r", encoding="utf-8") as f:
-            movies = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: {json_file} not found. Please run data_fetcher.py first.")
-        return
+_embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="all-MiniLM-L6-v2"
+)
 
-    print("Initializing ChromaDB...")
-    client = chromadb.PersistentClient(path=db_path)
-    
-    collection_name = "movie_collection"
-    
-    # Try to delete the collection if it already exists to start fresh
+
+def _get_client() -> chromadb.PersistentClient:
+    return chromadb.PersistentClient(path=DB_PATH)
+
+
+def get_collection() -> chromadb.Collection | None:
+    """Return the movie collection, or None if it doesn't exist."""
     try:
-        client.delete_collection(name=collection_name)
+        return _get_client().get_collection(COLLECTION_NAME, embedding_function=_embedding_fn)
+    except Exception:
+        return None
+
+
+def _movie_to_doc(movie: dict) -> tuple[str, dict, str]:
+    """Convert a movie dict to (document, metadata, id)."""
+    doc = f"Title: {movie['title']}\nGenres: {movie['genres']}\nOverview: {movie['overview']}"
+    meta = {
+        "title": movie["title"],
+        "genres": movie["genres"],
+        "release_date": movie["release_date"],
+        "vote_average": movie["vote_average"],
+        "language": movie.get("language", "en"),
+    }
+    return doc, meta, str(movie["id"])
+
+
+def setup_vector_db(json_path: str = "movies_data.json") -> None:
+    """Create and populate the ChromaDB collection from a JSON file."""
+    print(f"[VectorDB] Loading movies from {json_path}…")
+    with open(json_path, encoding="utf-8") as f:
+        movies: list[dict] = json.load(f)
+
+    client = _get_client()
+    try:
+        client.delete_collection(COLLECTION_NAME)
     except Exception:
         pass
-        
-    collection = client.create_collection(
-        name=collection_name, 
-        embedding_function=st_ef
-    )
+    collection = client.create_collection(COLLECTION_NAME, embedding_function=_embedding_fn)
 
-    documents = []
-    metadatas = []
-    ids = []
+    docs, metas, ids = zip(*[_movie_to_doc(m) for m in movies])
 
-    print(f"Preparing {len(movies)} movies for vectorization...")
-    for idx, movie in enumerate(movies):
-        # We combine title, genres, and overview for the semantic search
-        content = f"Title: {movie['title']}\nGenres: {movie['genres']}\nOverview: {movie['overview']}"
-        
-        documents.append(content)
-        metadatas.append({
-            "title": movie["title"],
-            "genres": movie["genres"],
-            "release_date": movie["release_date"],
-            "vote_average": movie["vote_average"],
-            "language": movie.get("language", "en")
-        })
-        ids.append(str(movie["id"]))
-
-    print("Adding movies to ChromaDB (this might take a minute depending on your local machine)...")
-    # Batch add to avoid memory issues
-    batch_size = 50
-    for i in range(0, len(documents), batch_size):
-        end_idx = min(i + batch_size, len(documents))
-        print(f"Processing batch {i} to {end_idx}...")
+    batch = 50
+    for i in range(0, len(docs), batch):
         collection.add(
-            documents=documents[i:end_idx],
-            metadatas=metadatas[i:end_idx],
-            ids=ids[i:end_idx]
+            documents=list(docs[i : i + batch]),
+            metadatas=list(metas[i : i + batch]),
+            ids=list(ids[i : i + batch]),
         )
+        print(f"[VectorDB] Indexed {min(i + batch, len(docs))}/{len(docs)} movies…")
 
-    print("Vector database built successfully!")
+    print("[VectorDB] Setup complete.")
 
-def add_movies_to_db(movies, db_path="./chroma_db"):
+
+def upsert_movies(movies: list[dict]) -> None:
+    """Add or update movies in an existing collection."""
     if not movies:
         return
-        
-    client = chromadb.PersistentClient(path=db_path)
-    try:
-        collection = client.get_collection(name="movie_collection", embedding_function=st_ef)
-    except Exception:
-        print("Collection does not exist. Run setup_vector_db first.")
+    col = get_collection()
+    if col is None:
+        print("[VectorDB] Collection not found. Run setup_vector_db() first.")
         return
 
-    documents = []
-    metadatas = []
-    ids = []
+    docs, metas, ids = zip(*[_movie_to_doc(m) for m in movies])
+    col.upsert(documents=list(docs), metadatas=list(metas), ids=list(ids))
+    print(f"[VectorDB] Upserted {len(movies)} movies.")
 
-    for movie in movies:
-        content = f"Title: {movie['title']}\nGenres: {movie['genres']}\nOverview: {movie['overview']}"
-        documents.append(content)
-        metadatas.append({
-            "title": movie["title"],
-            "genres": movie["genres"],
-            "release_date": movie["release_date"],
-            "vote_average": movie["vote_average"],
-            "language": movie.get("language", "en")
-        })
-        ids.append(str(movie["id"]))
+def query_movies(
+    query_text: str,
+    n_results: int = 15,
+    language_code: str | None = None,
+) -> dict | None:
+    """Query the vector store and return raw ChromaDB results."""
+    col = get_collection()
+    if col is None:
+        return None
 
-    print(f"Adding {len(movies)} new movies to ChromaDB...")
-    # Add to DB, Chroma handles ignoring existing IDs if we use upsert or if we just catch the warning
-    # We will use upsert to update if exists or insert if new
-    collection.upsert(
-        documents=documents,
-        metadatas=metadatas,
-        ids=ids
-    )
-    print("New movies added to the database successfully.")
+    params: dict = {"query_texts": [query_text], "n_results": n_results}
+    if language_code:
+        params["where"] = {"language": language_code}
+
+    results = col.query(**params)
+    return results if results["documents"][0] else None
+
 
 if __name__ == "__main__":
     setup_vector_db()
