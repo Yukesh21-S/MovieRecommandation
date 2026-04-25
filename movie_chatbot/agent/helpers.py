@@ -251,6 +251,22 @@ def extract_recent_movie_block(history: list[dict]) -> str:
     return ""
 
 
+def extract_last_movie_title(history: list[dict]) -> str | None:
+    """
+    Extract the last movie title the assistant referenced in a detail response.
+    Matches patterns like: **Title (2024)** — Genres, ⭐ x/10.
+    """
+    pat = re.compile(r"\*\*(?P<title>.+?)\s+\((?:\d{4}|\?)\)\*\*")
+    for msg in reversed(history):
+        if msg.get("role") != "assistant":
+            continue
+        m = pat.search(msg.get("content", ""))
+        if m:
+            title = m.group("title").strip()
+            return title or None
+    return None
+
+
 def parse_movie_block(movie_block: str) -> list[dict]:
     """
     Parse numbered movie block lines into structured items:
