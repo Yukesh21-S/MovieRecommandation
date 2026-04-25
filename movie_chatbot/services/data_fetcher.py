@@ -1,39 +1,73 @@
 """
-data_fetcher.py
 Fetches movie data from the TMDB API.
 """
 
-import os
-import json
 import datetime
+import json
+import os
+
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
 API_KEY = os.getenv("TMDB_API_KEY")
 BASE_URL = "https://api.tmdb.org/3"
 
-# ── Lookup maps ───────────────────────────────────────────────────────────────
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 LANGUAGE_MAP: dict[str, str] = {
-    "hindi": "hi", "french": "fr", "korean": "ko", "japanese": "ja",
-    "spanish": "es", "tamil": "ta", "telugu": "te", "malayalam": "ml",
-    "english": "en", "chinese": "zh", "german": "de", "italian": "it",
-    "portuguese": "pt", "arabic": "ar", "russian": "ru", "turkish": "tr",
+    "hindi": "hi",
+    "french": "fr",
+    "korean": "ko",
+    "japanese": "ja",
+    "spanish": "es",
+    "tamil": "ta",
+    "telugu": "te",
+    "malayalam": "ml",
+    "english": "en",
+    "chinese": "zh",
+    "german": "de",
+    "italian": "it",
+    "portuguese": "pt",
+    "arabic": "ar",
+    "russian": "ru",
+    "turkish": "tr",
 }
 
 GENRE_MAP: dict[str, int] = {
-    "action": 28, "adventure": 12, "animation": 16, "comedy": 35,
-    "crime": 80, "documentary": 99, "drama": 18, "family": 10751,
-    "fantasy": 14, "history": 36, "horror": 27, "romance": 10749,
-    "sci-fi": 878, "science fiction": 878, "thriller": 53, "war": 10752,
+    "action": 28,
+    "adventure": 12,
+    "animation": 16,
+    "comedy": 35,
+    "crime": 80,
+    "documentary": 99,
+    "drama": 18,
+    "family": 10751,
+    "fantasy": 14,
+    "history": 36,
+    "horror": 27,
+    "romance": 10749,
+    "sci-fi": 878,
+    "science fiction": 878,
+    "thriller": 53,
+    "war": 10752,
 }
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
 
 def _get_genre_mapping() -> dict[int, str]:
-    resp = requests.get(
+    resp = session.get(
         f"{BASE_URL}/genre/movie/list",
         params={"api_key": API_KEY, "language": "en-US"},
         timeout=10,
@@ -44,7 +78,6 @@ def _get_genre_mapping() -> dict[int, str]:
 
 
 def _clean_movie(movie: dict, genre_mapping: dict[int, str]) -> dict | None:
-    """Return a cleaned movie dict, or None if the movie should be skipped."""
     if not movie.get("overview"):
         return None
     genre_names = [genre_mapping.get(gid, "Unknown") for gid in movie.get("genre_ids", [])]
@@ -60,19 +93,17 @@ def _clean_movie(movie: dict, genre_mapping: dict[int, str]) -> dict | None:
 
 
 def _save(movies: list[dict], path: str = "movies_data.json") -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(movies, f, indent=4, ensure_ascii=False)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(movies, file, indent=4, ensure_ascii=False)
 
-# ── Public API ────────────────────────────────────────────────────────────────
 
 def search_movies(query: str) -> list[dict]:
-    """Search TMDB for a specific movie title (up to 2 pages)."""
-    print(f"[TMDB] Searching for '{query}'…")
+    print(f"[TMDB] Searching for '{query}'...")
     genre_mapping = _get_genre_mapping()
     results: list[dict] = []
 
     for page in range(1, 3):
-        resp = requests.get(
+        resp = session.get(
             f"{BASE_URL}/search/movie",
             params={"api_key": API_KEY, "language": "en-US", "query": query, "page": page},
             timeout=10,
@@ -99,17 +130,19 @@ def discover_movies(
     person_id: int | None = None,
     pages: int = 3,
 ) -> list[dict]:
-    """Discover movies by language, genre, person, or recency."""
-    print(f"[TMDB] Discovering movies (lang={language_code}, genre={genre_id}, sort={sort_by})…")
+    print(f"[TMDB] Discovering movies (lang={language_code}, genre={genre_id}, sort={sort_by})...")
     genre_mapping = _get_genre_mapping()
     today = datetime.date.today().isoformat()
     results: list[dict] = []
 
     for page in range(1, pages + 1):
         params: dict = {
-            "api_key": API_KEY, "language": "en-US",
-            "sort_by": sort_by, "include_adult": "false",
-            "vote_count.gte": 10, "primary_release_date.lte": today,
+            "api_key": API_KEY,
+            "language": "en-US",
+            "sort_by": sort_by,
+            "include_adult": "false",
+            "vote_count.gte": 10,
+            "primary_release_date.lte": today,
             "page": page,
         }
         if language_code:
@@ -121,7 +154,7 @@ def discover_movies(
         if person_id:
             params["with_people"] = person_id
 
-        resp = requests.get(f"{BASE_URL}/discover/movie", params=params, timeout=10)
+        resp = session.get(f"{BASE_URL}/discover/movie", params=params, timeout=10)
         if resp.status_code != 200:
             break
         data = resp.json()
@@ -137,8 +170,7 @@ def discover_movies(
 
 
 def get_person_id(name: str) -> int | None:
-    """Return the TMDB person ID for an actor or director."""
-    resp = requests.get(
+    resp = session.get(
         f"{BASE_URL}/search/person",
         params={"api_key": API_KEY, "query": name, "language": "en-US"},
         timeout=10,
@@ -151,8 +183,7 @@ def get_person_id(name: str) -> int | None:
 
 
 def fetch_and_save_diverse_movies(path: str = "movies_data.json") -> list[dict]:
-    """Build a diverse local dataset and save it to disk."""
-    print("[Setup] Building diversified movie dataset…")
+    print("[Setup] Building diversified movie dataset...")
     all_movies: list[dict] = []
     all_movies.extend(discover_movies(sort_by="popularity.desc", pages=2))
     all_movies.extend(discover_movies(language_code="ta", pages=2))
@@ -160,11 +191,8 @@ def fetch_and_save_diverse_movies(path: str = "movies_data.json") -> list[dict]:
     all_movies.extend(discover_movies(genre_id=GENRE_MAP["comedy"], pages=1))
 
     seen: set[int] = set()
-    unique = [m for m in all_movies if not (m["id"] in seen or seen.add(m["id"]))]  # type: ignore[func-returns-value]
+    unique = [movie for movie in all_movies if not (movie["id"] in seen or seen.add(movie["id"]))]  # type: ignore[func-returns-value]
     _save(unique, path)
     print(f"[Setup] Saved {len(unique)} unique movies.")
     return unique
 
-
-if __name__ == "__main__":
-    fetch_and_save_diverse_movies()

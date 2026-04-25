@@ -1,0 +1,4 @@
+[
+  {"id": 1, "query": "hi", "type": "chat", "checks": {"answer_keywords_any": ["movie", "hi", "hello"]}},
+  {"id": 2, "query": "Find Inception", "type": "search", "checks": {"title_keywords_any": ["inception"]}}
+]
