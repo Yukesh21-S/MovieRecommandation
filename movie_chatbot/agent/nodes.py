@@ -296,7 +296,8 @@ def respond_search(state: State) -> State:
             ),
         }
 
-    movie_block = format_movies([movies[0]])
+    # For single-movie detail, never truncate the overview.
+    movie_block = format_movies([movies[0]], overview_max_len=None)
     system = prompt_movie_search()
     user_msg = f'User asked about: "{title}"\n\nMovie data:\n{movie_block}'
     commentary = sanitize_commentary(_llm.invoke(build_messages(system, history, user_msg)).content.strip())
@@ -308,7 +309,7 @@ def respond_discover(state: State) -> State:
     if not movies:
         return {**state, "response": "Sorry, I couldn't find matching movies. Try rephrasing!"}
 
-    movie_block = format_movies(movies)
+    movie_block = format_movies(movies, overview_max_len=240)
     system = prompt_discover()
     user_msg = f'User request: "{query}"\n\nMatched movies:\n{movie_block}'
     commentary = sanitize_commentary(_llm.invoke(build_messages(system, history, user_msg)).content.strip())
@@ -330,13 +331,27 @@ def followup(state: State) -> State:
     # 1) If user refers to a specific number/ordinal, answer from that item directly.
     idx = extract_requested_index(q)
     if idx is not None and 1 <= idx <= len(items):
-        movie = items[idx - 1]
-        year = movie.get("year", "?")
+        picked = items[idx - 1]
+        title = picked.get("title", "")
+        year = picked.get("year", "?")
+
+        # Re-fetch full details; history list overview may be truncated.
+        detailed = None
+        results = vdb.query_movies(title, n_results=10)
+        if results:
+            candidates = results_to_movies(results)
+            detailed = find_exact_title(title, candidates) or (candidates[0] if candidates else None)
+        if not detailed:
+            new_movies = tmdb.search_movies(title)
+            if new_movies:
+                vdb.upsert_movies(new_movies)
+                detailed = find_exact_title(title, new_movies) or new_movies[0]
+        overview = (detailed or picked).get("overview") or ""
         return {
             **state,
             "response": (
-                f"**{movie['title']} ({year})** — {movie['genres']}, ⭐ {movie['rating']}/10.\n"
-                f"{movie.get('overview') or ''}".strip()
+                f"**{picked['title']} ({year})** — {picked['genres']}, ⭐ {picked['rating']}/10.\n"
+                f"{overview}".strip()
             ),
         }
 
@@ -369,14 +384,27 @@ def followup(state: State) -> State:
     titles = [it["title"] for it in items if it.get("title")]
     matched = fuzzy_match_title(extract_title(q), titles)
     if matched:
-        movie = next((it for it in items if it["title"] == matched), None)
-        if movie:
-            year = movie.get("year", "?")
+        picked = next((it for it in items if it["title"] == matched), None)
+        if picked:
+            title = picked.get("title", "")
+            year = picked.get("year", "?")
+
+            detailed = None
+            results = vdb.query_movies(title, n_results=10)
+            if results:
+                candidates = results_to_movies(results)
+                detailed = find_exact_title(title, candidates) or (candidates[0] if candidates else None)
+            if not detailed:
+                new_movies = tmdb.search_movies(title)
+                if new_movies:
+                    vdb.upsert_movies(new_movies)
+                    detailed = find_exact_title(title, new_movies) or new_movies[0]
+            overview = (detailed or picked).get("overview") or ""
             return {
                 **state,
                 "response": (
-                    f"**{movie['title']} ({year})** — {movie['genres']}, ⭐ {movie['rating']}/10.\n"
-                    f"{movie.get('overview') or ''}".strip()
+                    f"**{picked['title']} ({year})** — {picked['genres']}, ⭐ {picked['rating']}/10.\n"
+                    f"{overview}".strip()
                 ),
             }
 

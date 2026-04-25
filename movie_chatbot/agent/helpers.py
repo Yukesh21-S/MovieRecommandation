@@ -45,13 +45,24 @@ def extract_title(query: str) -> str:
     return q.rstrip("?").strip()
 
 
-def format_movies(movies: list[dict]) -> str:
+def _truncate(text: str, max_len: int | None) -> str:
+    if max_len is None:
+        return text
+    text = str(text or "").strip()
+    if len(text) <= max_len:
+        return text
+    # Keep it readable in lists, but signal it's truncated.
+    return text[: max(0, max_len - 1)].rstrip() + "…"
+
+
+def format_movies(movies: list[dict], overview_max_len: int | None = 200) -> str:
     lines = []
     for i, movie in enumerate(movies, 1):
         year = (movie.get("release_date") or "")[:4] or "?"
+        overview = _truncate(str(movie.get("overview", "")), overview_max_len)
         lines.append(
             f"{i}. {movie['title']} ({year}) | {movie['genres']} | ⭐ {movie['vote_average']}/10\n"
-            f"   {movie.get('overview', '')[:200]}"
+            f"   {overview}"
         )
     return "\n\n".join(lines)
 
