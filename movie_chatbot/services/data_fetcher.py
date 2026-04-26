@@ -16,6 +16,7 @@ load_dotenv()
 API_KEY = os.getenv("TMDB_API_KEY")
 BASE_URL = "https://api.tmdb.org/3"
 
+# HTTP session with retry behavior for unstable TMDB responses.
 session = requests.Session()
 retry_strategy = Retry(
     total=3,
@@ -78,6 +79,7 @@ def _get_genre_mapping() -> dict[int, str]:
 
 
 def _clean_movie(movie: dict, genre_mapping: dict[int, str]) -> dict | None:
+    # Normalize TMDB response fields and skip movies without an overview.
     if not movie.get("overview"):
         return None
     genre_names = [genre_mapping.get(gid, "Unknown") for gid in movie.get("genre_ids", [])]
@@ -93,11 +95,13 @@ def _clean_movie(movie: dict, genre_mapping: dict[int, str]) -> dict | None:
 
 
 def _save(movies: list[dict], path: str = "movies_data.json") -> None:
+    # Save the curated movie dataset to disk for later vector DB setup.
     with open(path, "w", encoding="utf-8") as file:
         json.dump(movies, file, indent=4, ensure_ascii=False)
 
 
 def search_movies(query: str) -> list[dict]:
+    # Search TMDB for a specific movie title.
     print(f"[TMDB] Searching for '{query}'...")
     genre_mapping = _get_genre_mapping()
     results: list[dict] = []
@@ -130,6 +134,7 @@ def discover_movies(
     person_id: int | None = None,
     pages: int = 3,
 ) -> list[dict]:
+    # Query TMDB discover API for recommendation candidates.
     print(f"[TMDB] Discovering movies (lang={language_code}, genre={genre_id}, sort={sort_by})...")
     genre_mapping = _get_genre_mapping()
     today = datetime.date.today().isoformat()
@@ -170,6 +175,7 @@ def discover_movies(
 
 
 def get_person_id(name: str) -> int | None:
+    # Resolve an actor or director name to a TMDB person ID.
     resp = session.get(
         f"{BASE_URL}/search/person",
         params={"api_key": API_KEY, "query": name, "language": "en-US"},
@@ -183,6 +189,7 @@ def get_person_id(name: str) -> int | None:
 
 
 def fetch_and_save_diverse_movies(path: str = "movies_data.json") -> list[dict]:
+    # Build and persist a diverse local dataset for the vector store bootstrap.
     print("[Setup] Building diversified movie dataset...")
     all_movies: list[dict] = []
     all_movies.extend(discover_movies(sort_by="popularity.desc", pages=2))

@@ -1,5 +1,7 @@
 """Reusable constants for intent detection and ranking."""
 
+# Map mood-related keywords to a fallback recommendation genre.
+# These are used when the user expresses an emotion but not a specific genre.
 MOOD_TO_GENRE: dict[str, str] = {
     "motivat": "drama",
     "inspir": "drama",
@@ -23,6 +25,7 @@ MOOD_TO_GENRE: dict[str, str] = {
     "anxi": "comedy",
 }
 
+# Keywords indicating the user likely wants a lighter, more comforting movie mood.
 LITE_MOOD_KEYWORDS = {
     "lite",
     "light",
@@ -45,9 +48,13 @@ LITE_MOOD_KEYWORDS = {
     "uplift",
 }
 
+# Genres considered appropriate for light, easygoing recommendations.
 LITE_GENRES = {"comedy", "family", "romance", "animation"}
+
+# Words that indicate the user is asking for newer or recently released movies.
 LATEST_KEYWORDS = {"latest", "new", "recent", "newest", "2022", "2023", "2024", "2025"}
 
+# Tokens and phrases that suggest the user is following up on an existing recommendation list.
 FOLLOWUP_HINTS = {
     "first",
     "second",

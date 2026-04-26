@@ -11,7 +11,7 @@ from ...services import vector_engine as vdb
 
 
 def retrieve(state: State) -> State:
-    # Person queries are much more reliable from TMDB discover(with_people) fallback.
+    # If the user asked about a person, skip local similarity retrieval and use fallback data.
     if state.get("person"):
         return {**state, "movies": []}
 

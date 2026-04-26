@@ -18,6 +18,7 @@ from ...services import vector_engine as vdb
 
 
 def search_movie(state: State) -> State:
+    # Extract the intended movie title and search local vector matches first.
     raw_title = state["search_title"] or state["query"]
     title = extract_title(raw_title)
     print(f"[Search] Looking for title: '{title}'")

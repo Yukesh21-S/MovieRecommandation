@@ -18,9 +18,11 @@ def classify(state: State) -> State:
     query, history = state["query"], state["history"]
     lower_query = query.lower()
 
+    # Detect explicit user cues for recent/new releases and light mood recommendations.
     is_latest = bool(LATEST_KEYWORDS & set(lower_query.split()))
     is_lite = bool(LITE_MOOD_KEYWORDS & set(lower_query.split()))
 
+    # Prefer follow-up handling when the user is referring to the recent conversation.
     if is_followup(query, history):
         return {
             **state,
@@ -51,6 +53,8 @@ def classify(state: State) -> State:
 
     lang_list = ", ".join(tmdb.LANGUAGE_MAP)
     genre_list = ", ".join(tmdb.GENRE_MAP)
+
+    # Use a deterministic LLM prompt to classify intent and extract structured metadata.
     prompt = f"""Classify this movie query. Respond ONLY with valid JSON — no markdown, no explanation.
 
 Query: "{query}"
@@ -76,6 +80,7 @@ JSON:
     except Exception:
         parsed = {}
 
+    # Convert normalized language and genre names into internal IDs.
     lang_code = tmdb.LANGUAGE_MAP.get((parsed.get("language") or "").lower())
     genre_id = tmdb.GENRE_MAP.get((parsed.get("genre") or "").lower())
 
@@ -84,6 +89,7 @@ JSON:
             genre_id = tmdb.GENRE_MAP.get(genre_name)
             break
 
+    # Default to drama if the intent classifier does not infer a genre.
     if not genre_id:
         genre_id = tmdb.GENRE_MAP.get("drama")
 

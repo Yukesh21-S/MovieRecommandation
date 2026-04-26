@@ -10,6 +10,7 @@ from ..services import data_fetcher as tmdb
 
 
 def extract_title(query: str) -> str:
+    # Strip common phrasing so we can resolve the user's intended movie title.
     q = query.strip()
     for prefix in [
         "find ",
@@ -68,6 +69,7 @@ def format_movies(movies: list[dict], overview_max_len: int | None = 200) -> str
 
 
 def results_to_movies(results: dict) -> list[dict]:
+    # Convert vector DB query results into movie dictionaries with overview text.
     movies = []
     for i, meta in enumerate(results["metadatas"][0]):
         doc = results["documents"][0][i]
@@ -180,6 +182,7 @@ def resolve_search_candidates(title: str, movies: list[dict]) -> tuple[list[dict
 
 
 def find_exact_title(title: str, movies: list[dict]) -> dict | None:
+    # Prefer exact or very close title matches while avoiding noisy short-word matches.
     title_lower = title.lower().strip()
     search_words = title_words(title)
     is_short_single_word = len(search_words) == 1 and len(next(iter(search_words), "")) <= 3

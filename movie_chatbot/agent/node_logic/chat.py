@@ -8,6 +8,7 @@ from ..state import State
 
 
 def chat(state: State) -> State:
+    """Generate a brief small-talk response for greetings and conversational queries."""
     system = "You are a friendly movie chatbot. Keep answers brief and warm."
     response = llm.invoke(build_messages(system, state["history"], state["query"])).content.strip()
     return {**state, "response": response}

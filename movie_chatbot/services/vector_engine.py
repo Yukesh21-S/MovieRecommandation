@@ -16,10 +16,12 @@ _embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
 
 
 def _get_client() -> chromadb.PersistentClient:
+    # Create a persistent ChromaDB client at the configured local path.
     return chromadb.PersistentClient(path=DB_PATH)
 
 
 def get_collection() -> chromadb.Collection | None:
+    # Return the existing movie collection if available.
     try:
         return _get_client().get_collection(COLLECTION_NAME, embedding_function=_embedding_fn)
     except Exception:
@@ -27,6 +29,7 @@ def get_collection() -> chromadb.Collection | None:
 
 
 def _movie_to_doc(movie: dict) -> tuple[str, dict, str]:
+    # Format a movie record for ChromaDB indexing with supporting metadata.
     doc = f"Title: {movie['title']}\nGenres: {movie['genres']}\nOverview: {movie['overview']}"
     meta = {
         "title": movie["title"],
@@ -39,6 +42,7 @@ def _movie_to_doc(movie: dict) -> tuple[str, dict, str]:
 
 
 def setup_vector_db(json_path: str = "movies_data.json") -> None:
+    # Populate the ChromaDB collection from the saved JSON dataset.
     print(f"[VectorDB] Loading movies from {json_path}...")
     with open(json_path, encoding="utf-8") as file:
         movies: list[dict] = json.load(file)
@@ -65,6 +69,7 @@ def setup_vector_db(json_path: str = "movies_data.json") -> None:
 
 
 def upsert_movies(movies: list[dict]) -> None:
+    # Add or update movies in the vector collection, ensuring unique IDs for each upsert.
     if not movies:
         return
     collection = get_collection()
@@ -92,6 +97,7 @@ def query_movies(
     n_results: int = 15,
     language_code: str | None = None,
 ) -> dict | None:
+    # Query the semantic movie collection using the user's text query.
     collection = get_collection()
     if collection is None:
         return None

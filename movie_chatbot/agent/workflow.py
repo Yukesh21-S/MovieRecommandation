@@ -18,6 +18,7 @@ from .state import State
 
 
 def _route_intent(state: State) -> Literal["chat", "followup", "search_movie", "retrieve"]:
+    # Route the graph based on the classified user intent.
     intent = state["intent"]
     if intent == "chat":
         return "chat"
@@ -29,12 +30,14 @@ def _route_intent(state: State) -> Literal["chat", "followup", "search_movie", "
 
 
 def _needs_discover_fallback(state: State) -> Literal["fetch_discover", "respond_discover"]:
+    # If there are too few candidate movies, fetch additional discover results.
     return "fetch_discover" if len(state["movies"]) < 3 else "respond_discover"
 
 
 def build_graph() -> StateGraph:
     graph = StateGraph(State)
 
+    # Define the workflow nodes and how they connect.
     graph.add_node("classify", classify)
     graph.add_node("search_movie", search_movie)
     graph.add_node("retrieve", retrieve)
@@ -61,6 +64,7 @@ _graph = build_graph()
 
 
 def run(query: str, history: list[dict] | None = None) -> tuple[str, list[dict]]:
+    """Execute the graph for a user query and return the assistant response plus updated history."""
     history = history or []
     final_state = _graph.invoke(
         {

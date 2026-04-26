@@ -23,6 +23,7 @@ def followup(state: State) -> State:
     q = state["query"].strip()
     q_lower = q.lower()
 
+    # Determine whether the user wants more detail on the last referenced movie.
     wants_detail = any(k in q_lower for k in ["detail", "detailed", "explain", "explanation", "elaborate", "more"])
     refers_to_previous = any(k in q_lower for k in ["this movie", "that movie", "this film", "that film", "it"])
     if wants_detail and refers_to_previous:

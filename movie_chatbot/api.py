@@ -16,7 +16,7 @@ from movie_chatbot.services import vector_engine as vdb
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# In-memory session store: session_id -> history
+# In-memory session store mapping session IDs to conversation history.
 _SESSIONS: dict[str, list[dict]] = {}
 
 
@@ -33,6 +33,7 @@ class ChatResponse(BaseModel):
 
 
 def ensure_db_ready() -> None:
+    """Ensure the movie dataset and vector database are available before serving requests."""
     collection = vdb.get_collection()
     if collection and collection.count() > 0:
         return
@@ -56,6 +57,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_event() -> None:
+    # Prepare data and vector store before accepting any requests.
     ensure_db_ready()
 
 
@@ -66,6 +68,7 @@ def health() -> dict:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest) -> ChatResponse:
+    # Use an existing session ID if provided; otherwise create a new one.
     session_id = payload.session_id or uuid.uuid4().hex
     if session_id in _SESSIONS:
         history = _SESSIONS[session_id]
@@ -81,6 +84,7 @@ def chat(payload: ChatRequest) -> ChatResponse:
 def reset_session(payload: dict) -> dict:
     session_id = str(payload.get("session_id") or "").strip()
     if session_id and session_id in _SESSIONS:
+        # Remove stored conversation history for this session.
         _SESSIONS.pop(session_id, None)
         return {"ok": True}
     return {"ok": False}

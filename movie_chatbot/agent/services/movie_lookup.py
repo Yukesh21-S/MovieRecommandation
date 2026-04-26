@@ -25,6 +25,7 @@ def get_movie_details_by_title(title: str) -> dict | None:
 
     results = vdb.query_movies(title, n_results=10)
     if results:
+        # Prefer the best match from the vector database before falling back to TMDB.
         candidates = results_to_movies(results)
         detailed = find_exact_title(title, candidates) or (candidates[0] if candidates else None)
         if detailed:
